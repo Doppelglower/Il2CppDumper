@@ -53,6 +53,7 @@ namespace Il2CppDumper
 
             var parameterDefinitionDic = new Dictionary<int, ParameterDefinition>();
             var eventDefinitionDic = new Dictionary<int, EventDefinition>();
+            TypeDefinition systemEnumType = null;
 
             //创建程序集，同时创建所有类
             foreach (var imageDef in metadata.imageDefs)
@@ -102,6 +103,10 @@ namespace Il2CppDumper
                     var typeDefinition = new TypeDefinition(namespaceName, typeName, (TypeAttributes)typeDef.flags);
                     typeDefinitionDic.Add(typeDef, typeDefinition);
                     typeModuleDic[typeDef] = moduleDefinition;
+                    if (namespaceName == "System" && typeName == "Enum")
+                    {
+                        systemEnumType = typeDefinition;
+                    }
                     if (typeDef.declaringTypeIndex == -1)
                     {
                         moduleDefinition.Types.Add(typeDefinition);
@@ -172,7 +177,15 @@ namespace Il2CppDumper
                     }
 
                     //parent
-                    if (typeDef.parentIndex >= 0)
+                    if (typeDef.IsEnum)
+                    {
+                        if (systemEnumType == null)
+                        {
+                            throw new InvalidDataException("System.Enum type definition was not found");
+                        }
+                        typeDefinition.BaseType = typeDefinition.Module.ImportReference(systemEnumType);
+                    }
+                    else if (typeDef.parentIndex >= 0)
                     {
                         var parentType = il2Cpp.types[typeDef.parentIndex];
                         var parentTypeRef = GetTypeReference(typeDefinition, parentType);
@@ -737,9 +750,15 @@ namespace Il2CppDumper
                         }
                     }
                 }
-                catch
+                catch (Exception exception)
                 {
-                    Console.WriteLine($"ERROR: Error while restoring attributeIndex {attributeIndex}");
+                    var range = il2Cpp.Version >= 29 && attributeIndex + 1 < metadata.attributeDataRanges.Length
+                        ? $", range=0x{metadata.attributeDataRanges[attributeIndex].startOffset:X}-0x{metadata.attributeDataRanges[attributeIndex + 1].startOffset:X}"
+                        : string.Empty;
+                    Console.WriteLine(
+                        $"ERROR: Error while restoring attributeIndex {attributeIndex}, " +
+                        $"customAttributeIndex={customAttributeIndex}, token=0x{token:X8}{range}: " +
+                        $"{exception.GetType().FullName}: {exception.Message}");
                 }
             }
         }

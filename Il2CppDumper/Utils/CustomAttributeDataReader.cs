@@ -144,7 +144,7 @@ namespace Il2CppDumper
             var type = executor.ReadEncodedTypeEnum(this, out var enumType);
             if (!executor.GetConstantValueFromBlob(type, this, out var blobValue) || blobValue == null)
             {
-                blobValue = new BlobValue();
+                throw new InvalidDataException($"Unsupported custom attribute value type {type} (0x{(byte)type:X2})");
             }
             blobValue.il2CppTypeEnum = type;
             if (enumType != null)

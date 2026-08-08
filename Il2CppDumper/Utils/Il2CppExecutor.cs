@@ -454,7 +454,7 @@ namespace Il2CppDumper
                             }
                             if (!GetConstantValueFromBlob(elementType, reader, out var data) || data == null)
                             {
-                                data = new BlobValue();
+                                throw new InvalidDataException($"Unsupported custom attribute array element type {elementType} (0x{(byte)elementType:X2})");
                             }
                             data.il2CppTypeEnum = elementType;
                             data.EnumType = elementEnumType;
@@ -494,9 +494,30 @@ namespace Il2CppDumper
                 var enumTypeIndex = reader.ReadCompressedInt32();
                 enumType = il2Cpp.types[enumTypeIndex];
                 var typeDef = GetTypeDefinitionFromIl2CppType(enumType);
-                type = il2Cpp.types[typeDef.elementTypeIndex].type;
+                type = GetEnumUnderlyingType(typeDef).type;
             }
             return type;
+        }
+
+        private Il2CppType GetEnumUnderlyingType(Il2CppTypeDefinition typeDef)
+        {
+            if (metadata.Version <= 31)
+            {
+                return il2Cpp.types[typeDef.elementTypeIndex];
+            }
+
+            var fieldEnd = typeDef.fieldStart + typeDef.field_count;
+            for (var fieldIndex = typeDef.fieldStart; fieldIndex < fieldEnd; fieldIndex++)
+            {
+                var fieldDef = metadata.fieldDefs[fieldIndex];
+                if (metadata.GetStringFromIndex(fieldDef.nameIndex) == "value__")
+                {
+                    return il2Cpp.types[fieldDef.typeIndex];
+                }
+            }
+
+            var typeName = metadata.GetStringFromIndex(typeDef.nameIndex);
+            throw new InvalidDataException($"Enum {typeName} has no value__ field");
         }
     }
 }
