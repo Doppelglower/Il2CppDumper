@@ -17,9 +17,9 @@ namespace Il2CppDumper
             var dummy = new DummyAssemblyGenerator(il2CppExecutor, addToken);
             foreach (var assembly in dummy.Assemblies)
             {
-                SanitizeConstants(assembly);
                 SanitizeMemberReferences(assembly);
                 SanitizeCustomAttributes(assembly);
+                SanitizeConstants(assembly);
                 File.WriteAllBytes(assembly.MainModule.Name, WriteAssembly(assembly));
             }
         }
@@ -35,6 +35,18 @@ namespace Il2CppDumper
                 StripRestoredCustomAttributes(assembly);
                 return WriteAssemblyToBytes(assembly);
             }
+            catch (System.Exception ex) when (IsConstantWriteException(ex))
+            {
+                StripNonPrimitiveConstants(assembly);
+                return WriteAssemblyToBytes(assembly);
+            }
+        }
+
+        private static bool IsConstantWriteException(System.Exception ex)
+        {
+            return ex is ResolutionException
+                || ex.StackTrace?.Contains("GetConstantType") == true
+                || ex.StackTrace?.Contains("AddConstant") == true;
         }
 
         private static byte[] WriteAssemblyToBytes(AssemblyDefinition assembly)
@@ -474,6 +486,91 @@ namespace Il2CppDumper
         }
 
         private static void SanitizeConstants(AssemblyDefinition assembly)
+        {
+            foreach (var type in GetAllTypes(assembly.MainModule.Types))
+            {
+                foreach (var field in type.Fields)
+                {
+                    if (!field.HasConstant)
+                    {
+                        continue;
+                    }
+                    if (CanWriteConstant(field.FieldType))
+                    {
+                        continue;
+                    }
+                    if (CanCecilResolveForConstant(field.FieldType) &&
+                        TryConvertEnumConstant(field.FieldType, field.Constant, out var coerced))
+                    {
+                        field.Constant = coerced;
+                        continue;
+                    }
+                    field.HasConstant = false;
+                    field.Constant = null;
+                }
+                foreach (var method in type.Methods)
+                {
+                    foreach (var parameter in method.Parameters)
+                    {
+                        if (!parameter.HasConstant)
+                        {
+                            continue;
+                        }
+                        if (CanWriteConstant(parameter.ParameterType))
+                        {
+                            continue;
+                        }
+                        if (CanCecilResolveForConstant(parameter.ParameterType) &&
+                            TryConvertEnumConstant(parameter.ParameterType, parameter.Constant, out var coerced))
+                        {
+                            parameter.Constant = coerced;
+                            continue;
+                        }
+                        parameter.HasConstant = false;
+                        parameter.Constant = null;
+                    }
+                }
+            }
+        }
+
+        private static bool TryConvertEnumConstant(TypeReference typeReference, object value, out object coerced)
+        {
+            coerced = null;
+            if (value == null || !TryGetEnumUnderlyingType(typeReference, out var underlyingType))
+            {
+                return false;
+            }
+            try
+            {
+                coerced = ConvertEnumValue(underlyingType, value);
+                return coerced != null && CanWriteConstant(underlyingType);
+            }
+            catch
+            {
+                coerced = null;
+                return false;
+            }
+        }
+
+        // Cecil GetConstantType still Resolve()'s the field type even when Constant is already an int.
+        // Nested TypeReferences such as PropertyBag/KeyCategory often fail; keep those stripped.
+        private static bool CanCecilResolveForConstant(TypeReference typeReference)
+        {
+            if (typeReference is TypeDefinition)
+            {
+                return true;
+            }
+            try
+            {
+                return typeReference.Resolve() != null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void StripNonPrimitiveConstants(AssemblyDefinition assembly)
         {
             foreach (var type in GetAllTypes(assembly.MainModule.Types))
             {

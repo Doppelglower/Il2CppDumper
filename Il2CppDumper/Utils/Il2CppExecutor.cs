@@ -342,6 +342,14 @@ namespace Il2CppDumper
         {
             var pointer = metadata.GetDefaultValueFromIndex(dataIndex);
             var defaultValueType = il2Cpp.types[typeIndex];
+            if (defaultValueType.type == Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE)
+            {
+                var typeDef = GetTypeDefinitionFromIl2CppType(defaultValueType);
+                if (typeDef != null && typeDef.IsEnum)
+                {
+                    defaultValueType = GetEnumUnderlyingType(typeDef);
+                }
+            }
             metadata.Position = pointer;
             if (GetConstantValueFromBlob(defaultValueType.type, metadata.Reader, out var blobValue))
             {
@@ -499,7 +507,7 @@ namespace Il2CppDumper
             return type;
         }
 
-        private Il2CppType GetEnumUnderlyingType(Il2CppTypeDefinition typeDef)
+        public Il2CppType GetEnumUnderlyingType(Il2CppTypeDefinition typeDef)
         {
             if (metadata.Version <= 31)
             {

@@ -519,35 +519,92 @@ namespace Il2CppDumper
 
         private static bool TrySetConstant(FieldDefinition fieldDefinition, TypeReference typeReference, object value)
         {
-            if (!CanWriteConstant(typeReference))
+            if (!TryCoerceConstant(typeReference, value, out var coerced))
             {
                 return false;
             }
-            fieldDefinition.Constant = value;
+            fieldDefinition.Constant = coerced;
             return true;
         }
 
         private static bool TrySetConstant(ParameterDefinition parameterDefinition, TypeReference typeReference, object value)
         {
-            if (!CanWriteConstant(typeReference))
+            if (!TryCoerceConstant(typeReference, value, out var coerced))
             {
                 return false;
             }
-            parameterDefinition.Constant = value;
+            parameterDefinition.Constant = coerced;
             return true;
         }
 
-        private static bool CanWriteConstant(TypeReference typeReference)
+        private static bool TryCoerceConstant(TypeReference typeReference, object value, out object coerced)
         {
-            if (typeReference == null)
+            coerced = null;
+            if (typeReference == null || value == null)
             {
                 return false;
             }
             if (IsPrimitiveConstantType(typeReference.FullName))
             {
+                coerced = value;
                 return true;
             }
+            if (!TryGetEnumUnderlyingType(typeReference, out var underlyingType))
+            {
+                return false;
+            }
+            coerced = ConvertEnumConstant(underlyingType, value);
+            return coerced != null;
+        }
+
+        private static bool TryGetEnumUnderlyingType(TypeReference type, out TypeReference underlyingType)
+        {
+            underlyingType = null;
+            TypeDefinition typeDefinition;
+            try
+            {
+                typeDefinition = type as TypeDefinition ?? type.Resolve();
+            }
+            catch
+            {
+                return false;
+            }
+            if (typeDefinition == null || !typeDefinition.IsEnum)
+            {
+                return false;
+            }
+            foreach (var field in typeDefinition.Fields)
+            {
+                if (field.Name == "value__")
+                {
+                    underlyingType = field.FieldType;
+                    return underlyingType != null;
+                }
+            }
             return false;
+        }
+
+        private static object ConvertEnumConstant(TypeReference underlyingType, object value)
+        {
+            try
+            {
+                return underlyingType.MetadataType switch
+                {
+                    MetadataType.SByte => Convert.ToSByte(value),
+                    MetadataType.Byte => Convert.ToByte(value),
+                    MetadataType.Int16 => Convert.ToInt16(value),
+                    MetadataType.UInt16 => Convert.ToUInt16(value),
+                    MetadataType.Int32 => Convert.ToInt32(value),
+                    MetadataType.UInt32 => Convert.ToUInt32(value),
+                    MetadataType.Int64 => Convert.ToInt64(value),
+                    MetadataType.UInt64 => Convert.ToUInt64(value),
+                    _ => null
+                };
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static bool IsPrimitiveConstantType(string fullName)

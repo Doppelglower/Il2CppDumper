@@ -25,11 +25,15 @@ namespace Il2CppDumper
         private readonly List<ulong> genericClassList = new();
         private readonly StringBuilder arrayClassHeader = new();
         private readonly StringBuilder methodInfoHeader = new();
+        private readonly Dictionary<Il2CppTypeDefinition, int> typeDefIndices = new();
+        private readonly List<EnumInfo> enumInfoList = new();
+        private readonly Dictionary<string, uint> enumSizeByName = new();
+        private readonly HashSet<string> enumMemberNames = new(StringComparer.Ordinal);
         private static readonly HashSet<ulong> methodInfoCache = new();
         private const long MaxGenericArgumentCount = 1024;
         private static readonly HashSet<string> keyword = new(StringComparer.Ordinal)
         { "klass", "monitor", "register", "_cs", "auto", "friend", "template", "flat", "default", "_ds", "interrupt",
-            "unsigned", "signed", "asm", "if", "case", "break", "continue", "do", "new", "_", "short", "union", "class", "namespace"};
+            "unsigned", "signed", "asm", "if", "case", "break", "continue", "do", "new", "_", "short", "union", "class", "namespace", "enum"};
         private static readonly HashSet<string> specialKeywords = new(StringComparer.Ordinal)
         { "inline", "near", "far" };
 
@@ -53,6 +57,7 @@ namespace Il2CppDumper
                 {
                     var typeDef = metadata.typeDefs[typeIndex];
                     typeDefImageNames.Add(typeDef, imageName);
+                    typeDefIndices[typeDef] = typeIndex;
                     CreateStructNameDic(typeDef);
                 }
             }
@@ -80,7 +85,14 @@ namespace Il2CppDumper
                 for (int typeIndex = imageDef.typeStart; typeIndex < typeEnd; typeIndex++)
                 {
                     var typeDef = metadata.typeDefs[typeIndex];
-                    AddStruct(typeDef);
+                    if (typeDef.IsEnum)
+                    {
+                        AddEnum(typeDef);
+                    }
+                    else
+                    {
+                        AddStruct(typeDef, typeIndex);
+                    }
                     var typeName = executor.GetTypeDefName(typeDef, true, true);
                     for (var methodIndexInType = 0; methodIndexInType < typeDef.method_count; methodIndexInType++)
                     {
@@ -388,6 +400,8 @@ namespace Il2CppDumper
             {
                 structInfoWithStructName.Add(info.TypeName + "_o", info);
             }
+            ComputeAllFieldsSizes();
+            var enumHeader = BuildEnumHeader();
             foreach (var info in structInfoList)
             {
                 headerStruct.Append(RecursionStructInfo(info));
@@ -430,8 +444,11 @@ namespace Il2CppDumper
                     Console.WriteLine($"WARNING: This il2cpp version [{il2Cpp.Version}] does not support generating .h files");
                     return;
             }
+            sb.Append(enumHeader);
+            sb.Append("#pragma pack(push, 1)\n");
             sb.Append(headerStruct);
             sb.Append(arrayClassHeader);
+            sb.Append("#pragma pack(pop)\n");
             sb.Append(methodInfoHeader);
             File.WriteAllText(outputDir + "il2cpp.h", sb.ToString());
         }
@@ -586,7 +603,8 @@ namespace Il2CppDumper
                         var typeDef = executor.GetTypeDefinitionFromIl2CppType(il2CppType);
                         if (typeDef.IsEnum)
                         {
-                            return ParseType(il2Cpp.types[typeDef.elementTypeIndex]);
+                            // IDA parse_decls resolves typedef names, not "enum Tag" when the stub is typedef int32_t Tag.
+                            return structNameDic[typeDef];
                         }
                         return structNameDic[typeDef] + "_o";
                     }
@@ -628,7 +646,7 @@ namespace Il2CppDumper
                         {
                             if (typeDef.IsEnum)
                             {
-                                return ParseType(il2Cpp.types[typeDef.elementTypeIndex]);
+                                return typeStructName;
                             }
                             return typeStructName + "_o";
                         }
@@ -684,14 +702,15 @@ namespace Il2CppDumper
             return signature;
         }
 
-        private void AddStruct(Il2CppTypeDefinition typeDef)
+        private void AddStruct(Il2CppTypeDefinition typeDef, int typeIndex)
         {
             var structInfo = new StructInfo();
             structInfoList.Add(structInfo);
             structInfo.TypeName = structNameDic[typeDef];
             structInfo.IsValueType = typeDef.IsValueType;
+            structInfo.TypeDefIndex = typeIndex;
             AddParents(typeDef, structInfo);
-            AddFields(typeDef, structInfo, null);
+            AddFields(typeDef, structInfo, null, typeIndex);
             AddVTableMethod(structInfo, typeDef);
             AddRGCTX(structInfo, typeDef);
         }
@@ -700,12 +719,17 @@ namespace Il2CppDumper
         {
             var genericClass = il2Cpp.MapVATR<Il2CppGenericClass>(pointer);
             var typeDef = executor.GetGenericClassTypeDefinition(genericClass);
+            if (typeDef.IsEnum)
+            {
+                return;
+            }
             var structInfo = new StructInfo();
             structInfoList.Add(structInfo);
             structInfo.TypeName = genericClassStructNameDic[pointer];
             structInfo.IsValueType = typeDef.IsValueType;
+            structInfo.TypeDefIndex = typeDefIndices.TryGetValue(typeDef, out var typeIndex) ? typeIndex : -1;
             AddParents(typeDef, structInfo);
-            AddFields(typeDef, structInfo, genericClass.context);
+            AddFields(typeDef, structInfo, genericClass.context, structInfo.TypeDefIndex);
             AddVTableMethod(structInfo, typeDef);
         }
 
@@ -724,7 +748,109 @@ namespace Il2CppDumper
             }
         }
 
-        private void AddFields(Il2CppTypeDefinition typeDef, StructInfo structInfo, Il2CppGenericContext context)
+        private void AddEnum(Il2CppTypeDefinition typeDef)
+        {
+            var enumName = structNameDic[typeDef];
+            Il2CppType underlyingType;
+            try
+            {
+                underlyingType = executor.GetEnumUnderlyingType(typeDef);
+            }
+            catch
+            {
+                return;
+            }
+            var enumInfo = new EnumInfo
+            {
+                Name = enumName,
+                UnderlyingTypeName = ParseType(underlyingType),
+                UnderlyingSize = GetPrimitiveLayoutSize(underlyingType.type)
+            };
+            var usedValues = new HashSet<long>();
+            if (typeDef.field_count > 0)
+            {
+                var fieldEnd = typeDef.fieldStart + typeDef.field_count;
+                for (var i = typeDef.fieldStart; i < fieldEnd; ++i)
+                {
+                    var fieldDef = metadata.fieldDefs[i];
+                    var fieldType = il2Cpp.types[fieldDef.typeIndex];
+                    if ((fieldType.attrs & FIELD_ATTRIBUTE_LITERAL) == 0)
+                    {
+                        continue;
+                    }
+                    var rawName = metadata.GetStringFromIndex(fieldDef.nameIndex);
+                    if (rawName == "value__")
+                    {
+                        continue;
+                    }
+                    var memberName = GetUniqueEnumMemberName(enumName + "_" + FixName(rawName));
+                    if (!metadata.GetFieldDefaultValueFromIndex(i, out var fieldDefault) || fieldDefault.dataIndex == -1)
+                    {
+                        continue;
+                    }
+                    if (!executor.TryGetDefaultValue(fieldDefault.typeIndex, fieldDefault.dataIndex, out var value) || value == null)
+                    {
+                        continue;
+                    }
+                    long numeric;
+                    try
+                    {
+                        numeric = Convert.ToInt64(value);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                    if (!usedValues.Add(numeric))
+                    {
+                        continue;
+                    }
+                    enumInfo.Members.Add(new EnumMemberInfo
+                    {
+                        Name = memberName,
+                        ValueLiteral = numeric.ToString(),
+                        Value = numeric
+                    });
+                }
+            }
+            enumInfoList.Add(enumInfo);
+            enumSizeByName[enumName] = enumInfo.UnderlyingSize;
+        }
+
+        private string GetUniqueEnumMemberName(string name)
+        {
+            var unique = name;
+            var i = 1;
+            while (!enumMemberNames.Add(unique))
+            {
+                unique = $"{name}_{i++}";
+            }
+            return unique;
+        }
+
+        private string BuildEnumHeader()
+        {
+            var sb = new StringBuilder();
+            foreach (var enumInfo in enumInfoList)
+            {
+                if (enumInfo.Members.Count == 0)
+                {
+                    sb.Append($"typedef {enumInfo.UnderlyingTypeName} {enumInfo.Name};\n");
+                    continue;
+                }
+                sb.Append($"typedef enum {enumInfo.Name}\n{{\n");
+                for (int i = 0; i < enumInfo.Members.Count; i++)
+                {
+                    var member = enumInfo.Members[i];
+                    sb.Append($"\t{member.Name} = {member.ValueLiteral}");
+                    sb.Append(i == enumInfo.Members.Count - 1 ? "\n" : ",\n");
+                }
+                sb.Append($"}} {enumInfo.Name};\n");
+            }
+            return sb.ToString();
+        }
+
+        private void AddFields(Il2CppTypeDefinition typeDef, StructInfo structInfo, Il2CppGenericContext context, int typeIndex)
         {
             if (typeDef.field_count > 0)
             {
@@ -738,10 +864,30 @@ namespace Il2CppDumper
                     {
                         continue;
                     }
+                    var isEnumField = IsEnumType(fieldType, context);
                     var structFieldInfo = new StructFieldInfo
                     {
-                        FieldTypeName = ParseType(fieldType, context)
+                        FieldTypeName = ParseType(fieldType, context),
+                        IsEnum = isEnumField
                     };
+                    if (isEnumField)
+                    {
+                        structFieldInfo.EnumTypeName = structFieldInfo.FieldTypeName;
+                        structFieldInfo.LayoutSize = GetTypeLayoutSize(fieldType, context);
+                        if (structFieldInfo.LayoutSize != 4)
+                        {
+                            structFieldInfo.FieldTypeName = GetEnumUnderlyingCType(fieldType, context);
+                        }
+                    }
+                    else if (fieldType.type == Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN)
+                    {
+                        structFieldInfo.FieldTypeName = "uint8_t";
+                        structFieldInfo.LayoutSize = 1;
+                    }
+                    else
+                    {
+                        structFieldInfo.LayoutSize = GetTypeLayoutSize(fieldType, context);
+                    }
                     var fieldName = FixName(metadata.GetStringFromIndex(fieldDef.nameIndex));
                     if (!cache.Add(fieldName))
                     {
@@ -750,7 +896,13 @@ namespace Il2CppDumper
                     structFieldInfo.FieldName = fieldName;
                     structFieldInfo.IsValueType = IsValueType(fieldType, context);
                     structFieldInfo.IsCustomType = IsCustomType(fieldType, context);
-                    if ((fieldType.attrs & FIELD_ATTRIBUTE_STATIC) != 0)
+                    var isStatic = (fieldType.attrs & FIELD_ATTRIBUTE_STATIC) != 0;
+                    if (typeIndex >= 0)
+                    {
+                        var rawOffset = il2Cpp.GetFieldOffsetFromIndex(typeIndex, i - typeDef.fieldStart, i, typeDef.IsValueType, isStatic);
+                        structFieldInfo.Offset = ToRelativeFieldOffset(rawOffset, structInfo.IsValueType, isStatic);
+                    }
+                    if (isStatic)
                     {
                         structInfo.StaticFields.Add(structFieldInfo);
                     }
@@ -760,41 +912,108 @@ namespace Il2CppDumper
                     }
                 }
             }
+            structInfo.UseExplicitLayout = structInfo.Fields.Count == 0 || structInfo.Fields.All(f => f.Offset >= 0);
+            // Open-generic typeDefs report every instantiated field at the same offset (usually 0).
+            // Sequential emit matches the real valuetype layout; explicit mode would comment later fields as OVERLAP.
+            if (context != null && HasCollapsedFieldOffsets(structInfo.Fields))
+            {
+                structInfo.UseExplicitLayout = false;
+            }
         }
+
+        private static bool HasCollapsedFieldOffsets(List<StructFieldInfo> fields)
+        {
+            if (fields == null || fields.Count <= 1)
+            {
+                return false;
+            }
+            var first = fields[0].Offset;
+            if (first < 0)
+            {
+                return false;
+            }
+            for (int i = 1; i < fields.Count; i++)
+            {
+                if (fields[i].Offset != first)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private int ToRelativeFieldOffset(int rawOffset, bool isValueType, bool isStatic)
+        {
+            if (rawOffset < 0)
+            {
+                return -1;
+            }
+            if (isStatic || isValueType)
+            {
+                return rawOffset;
+            }
+            var headerSize = ObjectHeaderSize;
+            if (rawOffset < headerSize)
+            {
+                return -1;
+            }
+            return rawOffset - headerSize;
+        }
+
+        private int ObjectHeaderSize => il2Cpp.Is32Bit ? 8 : 16;
 
         private void AddVTableMethod(StructInfo structInfo, Il2CppTypeDefinition typeDef)
         {
-            var dic = new SortedDictionary<int, Il2CppMethodDefinition>();
+            if (typeDef.vtable_count == 0 || metadata.vtableMethods == null)
+            {
+                return;
+            }
+            structInfo.VTableMethod = new StructVTableMethodInfo[typeDef.vtable_count];
             for (int i = 0; i < typeDef.vtable_count; i++)
             {
-                var vTableIndex = typeDef.vtableStart + i;
-                var encodedMethodIndex = metadata.vtableMethods[vTableIndex];
-                var usage = Metadata.GetEncodedIndexType(encodedMethodIndex);
-                var index = metadata.GetDecodedMethodIndex(encodedMethodIndex);
-                Il2CppMethodDefinition methodDef;
-                if (usage == 6) //kIl2CppMetadataUsageMethodRef
+                var methodInfo = new StructVTableMethodInfo
                 {
-                    var methodSpec = il2Cpp.methodSpecs[index];
-                    methodDef = metadata.methodDefs[methodSpec.methodDefinitionIndex];
+                    MethodName = "unknown"
+                };
+                structInfo.VTableMethod[i] = methodInfo;
+                try
+                {
+                    var vTableIndex = typeDef.vtableStart + i;
+                    if (vTableIndex < 0 || vTableIndex >= metadata.vtableMethods.Length)
+                    {
+                        continue;
+                    }
+                    var encodedMethodIndex = metadata.vtableMethods[vTableIndex];
+                    if (encodedMethodIndex == 0)
+                    {
+                        methodInfo.MethodName = "empty";
+                        continue;
+                    }
+                    var usage = Metadata.GetEncodedIndexType(encodedMethodIndex);
+                    var index = metadata.GetDecodedMethodIndex(encodedMethodIndex);
+                    if (usage == 6) //kIl2CppMetadataUsageMethodRef
+                    {
+                        if (index >= il2Cpp.methodSpecs.Length)
+                        {
+                            continue;
+                        }
+                        var methodSpec = il2Cpp.methodSpecs[index];
+                        (_, var specMethodName) = executor.GetMethodSpecName(methodSpec, false);
+                        methodInfo.MethodName = FixName(specMethodName);
+                    }
+                    else
+                    {
+                        if (index >= metadata.methodDefs.Length)
+                        {
+                            continue;
+                        }
+                        var methodDef = metadata.methodDefs[index];
+                        methodInfo.MethodName = FixName(metadata.GetStringFromIndex(methodDef.nameIndex));
+                    }
                 }
-                else
+                catch
                 {
-                    methodDef = metadata.methodDefs[index];
-                }
-                if (methodDef.slot != ushort.MaxValue)
-                {
-                    dic[methodDef.slot] = methodDef;
-                }
-            }
-            if (dic.Count > 0)
-            {
-                structInfo.VTableMethod = new StructVTableMethodInfo[dic.Last().Key + 1];
-                foreach (var i in dic)
-                {
-                    var methodInfo = new StructVTableMethodInfo();
-                    structInfo.VTableMethod[i.Key] = methodInfo;
-                    var methodDef = i.Value;
-                    methodInfo.MethodName = $"{FixName(metadata.GetStringFromIndex(methodDef.nameIndex))}";
+                    methodInfo.MethodName = "unknown";
                 }
             }
         }
@@ -964,50 +1183,19 @@ namespace Il2CppDumper
 
             var sb = new StringBuilder();
             var pre = new StringBuilder();
+            var embedParent = FindEmittableLayoutParent(info);
 
-            if (info.Parent != null)
+            sb.Append($"struct {info.TypeName}_Fields {{\n");
+            if (!string.IsNullOrEmpty(embedParent))
             {
-                var parentStructName = info.Parent + "_o";
-                pre.Append(RecursionStructInfo(structInfoWithStructName[parentStructName]));
-                sb.Append($"struct {info.TypeName}_Fields : {info.Parent}_Fields {{\n");
-                // C style
-                //sb.Append($"struct {info.TypeName}_Fields {{\n");
-                //sb.Append($"\t{info.Parent}_Fields _;\n");
+                var parentStructName = embedParent + "_o";
+                if (structInfoWithStructName.TryGetValue(parentStructName, out var parentInfo))
+                {
+                    pre.Append(RecursionStructInfo(parentInfo));
+                }
+                sb.Append($"\tstruct {embedParent}_Fields _;\n");
             }
-            else
-            {
-                if (il2Cpp is PE && !info.IsValueType)
-                {
-                    if (il2Cpp.Is32Bit)
-                    {
-                        sb.Append($"struct __declspec(align(4)) {info.TypeName}_Fields {{\n");
-                    }
-                    else
-                    {
-                        sb.Append($"struct __declspec(align(8)) {info.TypeName}_Fields {{\n");
-                    }
-                }
-                else
-                {
-                    sb.Append($"struct {info.TypeName}_Fields {{\n");
-                }
-            }
-            foreach (var field in info.Fields)
-            {
-                if (field.IsValueType)
-                {
-                    var fieldInfo = structInfoWithStructName[field.FieldTypeName];
-                    pre.Append(RecursionStructInfo(fieldInfo));
-                }
-                if (field.IsCustomType)
-                {
-                    sb.Append($"\tstruct {field.FieldTypeName} {field.FieldName};\n");
-                }
-                else
-                {
-                    sb.Append($"\t{field.FieldTypeName} {field.FieldName};\n");
-                }
-            }
+            AppendLayoutFields(sb, pre, info.Fields, info, embedParent, true);
             sb.Append("};\n");
 
             if (info.RGCTXs.Count > 0)
@@ -1093,26 +1281,111 @@ namespace Il2CppDumper
             if (info.StaticFields.Count > 0)
             {
                 sb.Append($"struct {info.TypeName}_StaticFields {{\n");
-                foreach (var field in info.StaticFields)
-                {
-                    if (field.IsValueType)
-                    {
-                        var fieldInfo = structInfoWithStructName[field.FieldTypeName];
-                        pre.Append(RecursionStructInfo(fieldInfo));
-                    }
-                    if (field.IsCustomType)
-                    {
-                        sb.Append($"\tstruct {field.FieldTypeName} {field.FieldName};\n");
-                    }
-                    else
-                    {
-                        sb.Append($"\t{field.FieldTypeName} {field.FieldName};\n");
-                    }
-                }
+                AppendLayoutFields(sb, pre, info.StaticFields, info, null, false);
                 sb.Append("};\n");
             }
 
             return pre.Append(sb).ToString();
+        }
+
+        private void AppendLayoutFields(StringBuilder sb, StringBuilder pre, List<StructFieldInfo> fields, StructInfo owner, string embedParent, bool isInstance)
+        {
+            var useExplicit = isInstance ? owner.UseExplicitLayout : fields.Count == 0 || fields.All(f => f.Offset >= 0);
+            if (!isInstance && HasCollapsedFieldOffsets(fields))
+            {
+                useExplicit = false;
+            }
+            uint currentOffset = 0;
+            if (isInstance && !string.IsNullOrEmpty(embedParent) && structInfoWithStructName.TryGetValue(embedParent + "_o", out var parentInfo))
+            {
+                currentOffset = parentInfo.FieldsSize;
+            }
+
+            IEnumerable<StructFieldInfo> ordered = useExplicit
+                ? fields.OrderBy(f => f.Offset < 0 ? int.MaxValue : f.Offset)
+                : fields;
+
+            var fieldList = ordered.ToList();
+            for (int k = 0; k < fieldList.Count; k++)
+            {
+                var field = fieldList[k];
+                EnsureValueTypeEmitted(pre, field);
+                var size = ResolveFieldLayoutSize(field);
+                if (useExplicit && field.Offset >= 0)
+                {
+                    if ((uint)field.Offset < currentOffset)
+                    {
+                        sb.Append($"\t// OVERLAP: {field.FieldTypeName} {field.FieldName}; // 0x{field.Offset:X}\n");
+                        continue;
+                    }
+                    if ((uint)field.Offset > currentOffset)
+                    {
+                        var pad = (uint)field.Offset - currentOffset;
+                        sb.Append($"\tchar _padding_{currentOffset:X}[0x{pad:X}];\n");
+                        currentOffset = (uint)field.Offset;
+                    }
+                    if (size == 0 && k < fieldList.Count - 1 && fieldList[k + 1].Offset > field.Offset)
+                    {
+                        size = (uint)(fieldList[k + 1].Offset - field.Offset);
+                    }
+                    if (size == 0)
+                    {
+                        size = (uint)il2Cpp.PointerSize;
+                    }
+                    currentOffset += size;
+                }
+                AppendFieldDeclaration(sb, field);
+            }
+        }
+
+        private void EnsureValueTypeEmitted(StringBuilder pre, StructFieldInfo field)
+        {
+            if (!field.IsValueType || string.IsNullOrEmpty(field.FieldTypeName))
+            {
+                return;
+            }
+            if (structInfoWithStructName.TryGetValue(field.FieldTypeName, out var fieldInfo))
+            {
+                pre.Append(RecursionStructInfo(fieldInfo));
+            }
+        }
+
+        private void AppendFieldDeclaration(StringBuilder sb, StructFieldInfo field)
+        {
+            if (field.IsEnum)
+            {
+                if (field.LayoutSize == 4)
+                {
+                    sb.Append($"\t{field.FieldTypeName} {field.FieldName};\n");
+                }
+                else if (!string.IsNullOrEmpty(field.EnumTypeName))
+                {
+                    sb.Append($"\t{field.FieldTypeName} {field.FieldName}; // enum {field.EnumTypeName}\n");
+                }
+                else
+                {
+                    sb.Append($"\t{field.FieldTypeName} {field.FieldName};\n");
+                }
+                return;
+            }
+            if (field.IsValueType)
+            {
+                var structName = field.FieldTypeName;
+                if (structName.EndsWith("_o", StringComparison.Ordinal))
+                {
+                    structName = structName[..^2];
+                }
+                sb.Append($"\tstruct {structName}_Fields {field.FieldName};\n");
+                return;
+            }
+            if (field.IsCustomType)
+            {
+                sb.Append($"\tstruct {field.FieldTypeName} {field.FieldName};\n");
+            }
+            else
+            {
+                sb.Append($"\t{field.FieldTypeName} {field.FieldName};\n");
+            }
         }
 
         private bool TryResolveGenericParameterType(Il2CppType il2CppType, Il2CppGenericContext context, bool methodGeneric, out Il2CppType type)
@@ -1419,6 +1692,301 @@ namespace Il2CppDumper
             methodInfoHeader.Append($"\tuint8_t parameters_count;\n");
             methodInfoHeader.Append($"\tuint8_t bitflags;\n");
             methodInfoHeader.Append($"}};\n");
+        }
+
+        private void ComputeAllFieldsSizes()
+        {
+            var visiting = new HashSet<StructInfo>();
+            foreach (var info in structInfoList)
+            {
+                ComputeFieldsSize(info, visiting);
+            }
+        }
+
+        private uint ComputeFieldsSize(StructInfo info, HashSet<StructInfo> visiting)
+        {
+            if (info.FieldsSizeComputed)
+            {
+                return info.FieldsSize;
+            }
+            if (!visiting.Add(info))
+            {
+                return info.FieldsSize;
+            }
+            uint size = 0;
+            var parentNameForSize = FindEmittableLayoutParent(info);
+            if (!string.IsNullOrEmpty(parentNameForSize) &&
+                structInfoWithStructName.TryGetValue(parentNameForSize + "_o", out var parentInfo))
+            {
+                size = ComputeFieldsSize(parentInfo, visiting);
+            }
+            if (info.UseExplicitLayout)
+            {
+                foreach (var field in info.Fields)
+                {
+                    if (field.Offset < 0)
+                    {
+                        continue;
+                    }
+                    var fieldSize = ResolveFieldLayoutSize(field, visiting);
+                    var end = (uint)field.Offset + fieldSize;
+                    if (end > size)
+                    {
+                        size = end;
+                    }
+                }
+            }
+            else
+            {
+                foreach (var field in info.Fields)
+                {
+                    size += ResolveFieldLayoutSize(field, visiting);
+                }
+            }
+            info.FieldsSize = size;
+            info.FieldsSizeComputed = true;
+            visiting.Remove(info);
+            return size;
+        }
+
+        private uint ResolveFieldLayoutSize(StructFieldInfo field)
+        {
+            return ResolveFieldLayoutSize(field, null);
+        }
+
+        private uint ResolveFieldLayoutSize(StructFieldInfo field, HashSet<StructInfo> visiting)
+        {
+            if (field.LayoutSize > 0)
+            {
+                return field.LayoutSize;
+            }
+            if (field.IsEnum && !string.IsNullOrEmpty(field.EnumTypeName) &&
+                enumSizeByName.TryGetValue(field.EnumTypeName, out var enumSize))
+            {
+                field.LayoutSize = enumSize;
+                return enumSize;
+            }
+            if (field.IsValueType && structInfoWithStructName.TryGetValue(field.FieldTypeName, out var nested))
+            {
+                var nestedSize = visiting == null ? nested.FieldsSize : ComputeFieldsSize(nested, visiting);
+                if (nestedSize > 0)
+                {
+                    field.LayoutSize = nestedSize;
+                }
+                return nestedSize;
+            }
+            if (!string.IsNullOrEmpty(field.FieldTypeName) && field.FieldTypeName.EndsWith("*", StringComparison.Ordinal))
+            {
+                return (uint)il2Cpp.PointerSize;
+            }
+            return GetCTypeLayoutSize(field.FieldTypeName);
+        }
+
+        private uint GetCTypeLayoutSize(string typeName)
+        {
+            return typeName switch
+            {
+                "uint8_t" or "int8_t" or "bool" => 1,
+                "uint16_t" or "int16_t" => 2,
+                "uint32_t" or "int32_t" or "float" => 4,
+                "uint64_t" or "int64_t" or "double" => 8,
+                "intptr_t" or "uintptr_t" => (uint)il2Cpp.PointerSize,
+                _ => (uint)il2Cpp.PointerSize
+            };
+        }
+
+        private string FindEmittableLayoutParent(StructInfo info)
+        {
+            var parent = info.Parent;
+            var guard = new HashSet<string>(StringComparer.Ordinal);
+            while (!string.IsNullOrEmpty(parent) && guard.Add(parent))
+            {
+                if (structInfoWithStructName.TryGetValue(parent + "_o", out var parentInfo) &&
+                    HasLayoutFields(parentInfo, new HashSet<StructInfo>()))
+                {
+                    return parent;
+                }
+                if (parentInfo == null)
+                {
+                    break;
+                }
+                parent = parentInfo.Parent;
+            }
+            return null;
+        }
+
+        private bool HasLayoutFields(StructInfo info, HashSet<StructInfo> visiting)
+        {
+            if (info.Fields.Count > 0)
+            {
+                return true;
+            }
+            if (!visiting.Add(info))
+            {
+                return false;
+            }
+            if (string.IsNullOrEmpty(info.Parent))
+            {
+                return false;
+            }
+            if (structInfoWithStructName.TryGetValue(info.Parent + "_o", out var parentInfo))
+            {
+                return HasLayoutFields(parentInfo, visiting);
+            }
+            return false;
+        }
+
+        private bool IsEnumType(Il2CppType il2CppType, Il2CppGenericContext context)
+        {
+            switch (il2CppType.type)
+            {
+                case Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE:
+                    {
+                        var typeDef = executor.GetTypeDefinitionFromIl2CppType(il2CppType);
+                        return typeDef != null && typeDef.IsEnum;
+                    }
+                case Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST:
+                    {
+                        var genericClass = il2Cpp.MapVATR<Il2CppGenericClass>(il2CppType.data.generic_class);
+                        var typeDef = executor.GetGenericClassTypeDefinition(genericClass);
+                        return typeDef != null && typeDef.IsEnum;
+                    }
+                case Il2CppTypeEnum.IL2CPP_TYPE_VAR:
+                    {
+                        return TryResolveGenericParameterType(il2CppType, context, false, out var type) &&
+                               IsEnumType(type, null);
+                    }
+                case Il2CppTypeEnum.IL2CPP_TYPE_MVAR:
+                    {
+                        return TryResolveGenericParameterType(il2CppType, context, true, out var type) &&
+                               IsEnumType(type, null);
+                    }
+                default:
+                    return false;
+            }
+        }
+
+        private string GetEnumUnderlyingCType(Il2CppType il2CppType, Il2CppGenericContext context)
+        {
+            var underlying = GetEnumUnderlyingIl2CppType(il2CppType, context);
+            return underlying == null ? "int32_t" : ParseType(underlying);
+        }
+
+        private Il2CppType GetEnumUnderlyingIl2CppType(Il2CppType il2CppType, Il2CppGenericContext context)
+        {
+            try
+            {
+                switch (il2CppType.type)
+                {
+                    case Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE:
+                        return executor.GetEnumUnderlyingType(executor.GetTypeDefinitionFromIl2CppType(il2CppType));
+                    case Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST:
+                        {
+                            var genericClass = il2Cpp.MapVATR<Il2CppGenericClass>(il2CppType.data.generic_class);
+                            return executor.GetEnumUnderlyingType(executor.GetGenericClassTypeDefinition(genericClass));
+                        }
+                    case Il2CppTypeEnum.IL2CPP_TYPE_VAR:
+                        if (TryResolveGenericParameterType(il2CppType, context, false, out var type))
+                        {
+                            return GetEnumUnderlyingIl2CppType(type, null);
+                        }
+                        break;
+                    case Il2CppTypeEnum.IL2CPP_TYPE_MVAR:
+                        if (TryResolveGenericParameterType(il2CppType, context, true, out var type2))
+                        {
+                            return GetEnumUnderlyingIl2CppType(type2, null);
+                        }
+                        break;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+            return null;
+        }
+
+        private uint GetTypeLayoutSize(Il2CppType il2CppType, Il2CppGenericContext context)
+        {
+            switch (il2CppType.type)
+            {
+                case Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN:
+                case Il2CppTypeEnum.IL2CPP_TYPE_I1:
+                case Il2CppTypeEnum.IL2CPP_TYPE_U1:
+                    return 1;
+                case Il2CppTypeEnum.IL2CPP_TYPE_CHAR:
+                case Il2CppTypeEnum.IL2CPP_TYPE_I2:
+                case Il2CppTypeEnum.IL2CPP_TYPE_U2:
+                    return 2;
+                case Il2CppTypeEnum.IL2CPP_TYPE_I4:
+                case Il2CppTypeEnum.IL2CPP_TYPE_U4:
+                case Il2CppTypeEnum.IL2CPP_TYPE_R4:
+                    return 4;
+                case Il2CppTypeEnum.IL2CPP_TYPE_I8:
+                case Il2CppTypeEnum.IL2CPP_TYPE_U8:
+                case Il2CppTypeEnum.IL2CPP_TYPE_R8:
+                    return 8;
+                case Il2CppTypeEnum.IL2CPP_TYPE_I:
+                case Il2CppTypeEnum.IL2CPP_TYPE_U:
+                    return (uint)il2Cpp.PointerSize;
+                case Il2CppTypeEnum.IL2CPP_TYPE_STRING:
+                case Il2CppTypeEnum.IL2CPP_TYPE_PTR:
+                case Il2CppTypeEnum.IL2CPP_TYPE_CLASS:
+                case Il2CppTypeEnum.IL2CPP_TYPE_OBJECT:
+                case Il2CppTypeEnum.IL2CPP_TYPE_ARRAY:
+                case Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY:
+                case Il2CppTypeEnum.IL2CPP_TYPE_TYPEDBYREF:
+                    return (uint)il2Cpp.PointerSize;
+                case Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE:
+                    {
+                        var typeDef = executor.GetTypeDefinitionFromIl2CppType(il2CppType);
+                        if (typeDef != null && typeDef.IsEnum)
+                        {
+                            return GetPrimitiveLayoutSize(executor.GetEnumUnderlyingType(typeDef).type);
+                        }
+                        return 0;
+                    }
+                case Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST:
+                    {
+                        var genericClass = il2Cpp.MapVATR<Il2CppGenericClass>(il2CppType.data.generic_class);
+                        var typeDef = executor.GetGenericClassTypeDefinition(genericClass);
+                        if (typeDef != null && typeDef.IsEnum)
+                        {
+                            return GetPrimitiveLayoutSize(executor.GetEnumUnderlyingType(typeDef).type);
+                        }
+                        if (typeDef != null && !typeDef.IsValueType)
+                        {
+                            return (uint)il2Cpp.PointerSize;
+                        }
+                        return 0;
+                    }
+                case Il2CppTypeEnum.IL2CPP_TYPE_VAR:
+                    if (TryResolveGenericParameterType(il2CppType, context, false, out var type))
+                    {
+                        return GetTypeLayoutSize(type, null);
+                    }
+                    return (uint)il2Cpp.PointerSize;
+                case Il2CppTypeEnum.IL2CPP_TYPE_MVAR:
+                    if (TryResolveGenericParameterType(il2CppType, context, true, out var type2))
+                    {
+                        return GetTypeLayoutSize(type2, null);
+                    }
+                    return (uint)il2Cpp.PointerSize;
+                default:
+                    return (uint)il2Cpp.PointerSize;
+            }
+        }
+
+        private static uint GetPrimitiveLayoutSize(Il2CppTypeEnum type)
+        {
+            return type switch
+            {
+                Il2CppTypeEnum.IL2CPP_TYPE_BOOLEAN or Il2CppTypeEnum.IL2CPP_TYPE_I1 or Il2CppTypeEnum.IL2CPP_TYPE_U1 => 1,
+                Il2CppTypeEnum.IL2CPP_TYPE_CHAR or Il2CppTypeEnum.IL2CPP_TYPE_I2 or Il2CppTypeEnum.IL2CPP_TYPE_U2 => 2,
+                Il2CppTypeEnum.IL2CPP_TYPE_I4 or Il2CppTypeEnum.IL2CPP_TYPE_U4 or Il2CppTypeEnum.IL2CPP_TYPE_R4 => 4,
+                Il2CppTypeEnum.IL2CPP_TYPE_I8 or Il2CppTypeEnum.IL2CPP_TYPE_U8 or Il2CppTypeEnum.IL2CPP_TYPE_R8 => 8,
+                _ => 4
+            };
         }
     }
 }

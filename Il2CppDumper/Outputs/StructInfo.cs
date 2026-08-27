@@ -12,6 +12,10 @@ namespace Il2CppDumper
         public List<StructFieldInfo> StaticFields = new();
         public StructVTableMethodInfo[] VTableMethod = Array.Empty<StructVTableMethodInfo>();
         public List<StructRGCTXInfo> RGCTXs = new();
+        public int TypeDefIndex = -1;
+        public uint FieldsSize;
+        public bool FieldsSizeComputed;
+        public bool UseExplicitLayout;
     }
 
     public class StructFieldInfo
@@ -20,6 +24,25 @@ namespace Il2CppDumper
         public string FieldName;
         public bool IsValueType;
         public bool IsCustomType;
+        public bool IsEnum;
+        public string EnumTypeName;
+        public int Offset = -1;
+        public uint LayoutSize;
+    }
+
+    public class EnumInfo
+    {
+        public string Name;
+        public string UnderlyingTypeName;
+        public uint UnderlyingSize;
+        public List<EnumMemberInfo> Members = new();
+    }
+
+    public class EnumMemberInfo
+    {
+        public string Name;
+        public string ValueLiteral;
+        public long Value;
     }
 
     public class StructVTableMethodInfo

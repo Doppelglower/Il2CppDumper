@@ -8,7 +8,20 @@ Unity il2cpp reverse engineer
 
 ## About This Fork
 
-This fork includes experimental adaptations for newer Unity/IL2CPP metadata versions, including v35/v38/v39 used by Unity 6000.x. The changes improve metadata parsing, method address recovery, DummyDll generation, and `il2cpp.h` generation for newer versions.
+This repository is based on [HZBHZB1234/Il2CppDumper](https://github.com/HZBHZB1234/Il2CppDumper), which itself is based on [c01ns/Il2CppDumper](https://github.com/c01ns/Il2CppDumper) and [Perfare/Il2CppDumper](https://github.com/Perfare/Il2CppDumper).
+
+It keeps the experimental Unity 6000.x / metadata v35–v39 work from those forks, and adds IDA-oriented `il2cpp.h` layout plus DummyDll enum constant fixes.
+
+### Changes in this fork
+
+* DummyDll: write enum member constants as the underlying integer so ILSpy/dnSpy can recover values (enable **Always show enum member values** if sequential enums omit `= n`)
+* `il2cpp.h`: `#pragma pack(1)` C layout, embed parent `_Fields` instead of C++ inheritance, drop `__declspec(align(8))`, insert padding from field offsets
+* Enums: emit `typedef enum Name { ... } Name;` (empty IL2CPP stubs stay `typedef int32_t Name`) so IDA `parse_decls` accepts field and signature types
+* Generic valuetypes: if every field reports the same offset (usually `0`), emit fields sequentially instead of commenting later members as `OVERLAP`
+* VTable: fill by slot index, length = `vtable_count`; empty slots are named `empty`
+* File dialog: metadata picker accepts `*.*`, not only `global-metadata.dat`
+
+Use **`ida_with_struct_py3.py`** with the generated `il2cpp.h` and `script.json` (plain `ida.py` only sets names).
 
 The newer-version support has only been self-tested on a small number of games. IL2CPP layouts, metadata formats, and protections vary by Unity version, platform, and project. If a specific game cannot be dumped, you need to debug and modify the source code yourself. I do not provide one-by-one adaptation for every game or protected build.
 
@@ -22,7 +35,7 @@ This project is provided for learning, research, interoperability, and analysis 
 * Supports ELF, ELF64, Mach-O, PE, NSO and WASM format
 * Supports Unity 5.3 - 2022.2, with experimental support for newer Unity metadata versions such as v35/v38/v39 (Unity 6000.x)
 * Supports generate IDA, Ghidra and Binary Ninja scripts to help them better analyze il2cpp files
-* Supports generate structures header file
+* Supports generate an IDA-oriented packed `il2cpp.h` header
 * Supports Android memory dumped `libil2cpp.so` file to bypass protection
 * Support bypassing simple PE protection
 
@@ -44,7 +57,7 @@ Il2CppDumper.exe <executable-file> <global-metadata> <output-directory>
 
 Folder, containing all restored dll files
 
-Use [dnSpy](https://github.com/0xd4d/dnSpy), [ILSpy](https://github.com/icsharpcode/ILSpy) or other .Net decompiler tools to view
+Use [dnSpy](https://github.com/0xd4d/dnSpy), [ILSpy](https://github.com/icsharpcode/ILSpy) or other .Net decompiler tools to view. Enum members keep their integer constants; ILSpy may still hide sequential `= 0, 1, 2, …` unless **Always show enum member values** is enabled.
 
 Can be used to extract Unity `MonoBehaviour` and `MonoScript`, for [UtinyRipper](https://github.com/mafaca/UtinyRipper), [UABE](https://7daystodie.com/forums/showthread.php?22675-Unity-Assets-Bundle-Extractor)
 
@@ -52,9 +65,9 @@ Can be used to extract Unity `MonoBehaviour` and `MonoScript`, for [UtinyRipper]
 
 For IDA
 
-#### ida_with_struct.py
+#### ida_with_struct.py / ida_with_struct_py3.py
 
-For IDA, read il2cpp.h file and apply structure information in IDA
+For IDA: parse `il2cpp.h` and apply structure / signature types. Prefer the Python 3 script.
 
 #### il2cpp.h
 
@@ -129,4 +142,7 @@ If you have a rooted Android phone, you can try my other project [Zygisk-Il2CppD
 
 ## Credits
 
+- Perfare - [Il2CppDumper](https://github.com/Perfare/Il2CppDumper)
+- c01ns - [Il2CppDumper](https://github.com/c01ns/Il2CppDumper) (Unity 6000 / metadata v35–v39)
+- HZBHZB1234 - [Il2CppDumper](https://github.com/HZBHZB1234/Il2CppDumper) (v39 attribute / enum DummyDll fixes)
 - Jumboperson - [Il2CppDumper](https://github.com/Jumboperson/Il2CppDumper)
