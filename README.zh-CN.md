@@ -14,6 +14,7 @@ Unity il2cpp逆向工程
 
 ### 本 fork 的改动
 
+* DummyDll：按 `declaringTypeIndex` 挂嵌套类（与 `dump.cs` 同一数据源），不再使用可能错位的 `nestedTypes` 表
 * DummyDll：把 enum 成员常量写成底层整数，ILSpy/dnSpy 能还原数值（连续从 0 递增的 enum 若看不到 `= n`，请打开 **Always show enum member values**）
 * `il2cpp.h`：`#pragma pack(1)` 的 C 布局，父类改为内嵌 `_Fields` 而不是 C++ 继承，去掉 `__declspec(align(8))`，按字段 offset 插入 padding
 * Enum：有成员时输出 `typedef enum Name { ... } Name;`，IL2CPP 空 stub 仍是 `typedef int32_t Name`，便于 IDA `parse_decls` 识别字段和签名类型

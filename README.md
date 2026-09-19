@@ -14,6 +14,7 @@ It keeps the experimental Unity 6000.x / metadata v35–v39 work from those fork
 
 ### Changes in this fork
 
+* DummyDll: nest types from `declaringTypeIndex` (same source as `dump.cs`) instead of the `nestedTypes` table, so nested classes keep the correct parent
 * DummyDll: write enum member constants as the underlying integer so ILSpy/dnSpy can recover values (enable **Always show enum member values** if sequential enums omit `= n`)
 * `il2cpp.h`: `#pragma pack(1)` C layout, embed parent `_Fields` instead of C++ inheritance, drop `__declspec(align(8))`, insert padding from field offsets
 * Enums: emit `typedef enum Name { ... } Name;` (empty IL2CPP stubs stay `typedef int32_t Name`) so IDA `parse_decls` accepts field and signature types

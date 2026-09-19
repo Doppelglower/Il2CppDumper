@@ -113,35 +113,22 @@ namespace Il2CppDumper
                     }
                 }
             }
-            foreach (var imageDef in metadata.imageDefs)
+            foreach (var pair in typeDefinitionDic)
             {
-                var typeEnd = imageDef.typeStart + imageDef.typeCount;
-                for (var index = imageDef.typeStart; index < typeEnd; ++index)
+                var typeDef = pair.Key;
+                var typeDefinition = pair.Value;
+                if (!TryGetDeclaringTypeDefinition(typeDef, out var declaringTypeDefinition))
                 {
-                    var typeDef = metadata.typeDefs[index];
-                    var typeDefinition = typeDefinitionDic[typeDef];
-
-                    //nestedtype
-                    for (int i = 0; i < typeDef.nested_type_count; i++)
-                    {
-                        var nestedTypeIndex = typeDef.nestedTypesStart + i;
-                        if (nestedTypeIndex < 0 || nestedTypeIndex >= metadata.nestedTypeIndices.Length)
-                        {
-                            continue;
-                        }
-                        var nestedIndex = metadata.nestedTypeIndices[nestedTypeIndex];
-                        if (nestedIndex < 0 || nestedIndex >= metadata.typeDefs.Length)
-                        {
-                            continue;
-                        }
-                        var nestedTypeDef = metadata.typeDefs[nestedIndex];
-                        var nestedTypeDefinition = typeDefinitionDic[nestedTypeDef];
-                        AttachNestedType(typeDefinition, nestedTypeDefinition);
-                    }
+                    continue;
                 }
+                AttachNestedType(declaringTypeDefinition, typeDefinition);
             }
             foreach (var pair in typeDefinitionDic)
             {
+                if (pair.Value.DeclaringType != null)
+                {
+                    continue;
+                }
                 if (pair.Value.Module == null && typeModuleDic.TryGetValue(pair.Key, out var moduleDefinition))
                 {
                     moduleDefinition.Types.Add(pair.Value);
@@ -491,6 +478,30 @@ namespace Il2CppDumper
             }
         }
 
+        private bool TryGetDeclaringTypeDefinition(Il2CppTypeDefinition typeDef, out TypeDefinition declaringTypeDefinition)
+        {
+            declaringTypeDefinition = null;
+            if (typeDef.declaringTypeIndex < 0 || il2Cpp.types == null || typeDef.declaringTypeIndex >= il2Cpp.types.Length)
+            {
+                return false;
+            }
+            var declaringIl2CppType = il2Cpp.types[typeDef.declaringTypeIndex];
+            if (declaringIl2CppType == null)
+            {
+                return false;
+            }
+            Il2CppTypeDefinition declaringTypeDef;
+            try
+            {
+                declaringTypeDef = executor.GetTypeDefinitionFromIl2CppType(declaringIl2CppType);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+            return declaringTypeDef != null && typeDefinitionDic.TryGetValue(declaringTypeDef, out declaringTypeDefinition);
+        }
+
         private static void AttachNestedType(TypeDefinition declaringType, TypeDefinition nestedType)
         {
             if (declaringType == null || nestedType == null || ReferenceEquals(declaringType, nestedType))
@@ -505,8 +516,24 @@ namespace Il2CppDumper
             {
                 return;
             }
+            if (IsNestedAncestor(nestedType, declaringType))
+            {
+                return;
+            }
             nestedType.Module?.Types.Remove(nestedType);
             declaringType.NestedTypes.Add(nestedType);
+        }
+
+        private static bool IsNestedAncestor(TypeDefinition possibleAncestor, TypeDefinition type)
+        {
+            for (var current = type; current != null; current = current.DeclaringType)
+            {
+                if (ReferenceEquals(current, possibleAncestor))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private void AddMetadataOffsetAttribute(ModuleDefinition moduleDefinition, MethodReference metadataOffsetAttribute, Collection<CustomAttribute> customAttributes, uint metadataOffset)
